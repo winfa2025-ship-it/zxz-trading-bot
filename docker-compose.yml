@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  zxz-trading-bot:
+    build: .
+    container_name: zxz-trading-bot
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
