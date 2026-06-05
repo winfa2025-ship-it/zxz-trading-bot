@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: zxz-api
+    runtime: docker
+    repo: https://github.com/winfa2025-ship-it/zxz-trading-bot
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        value: zxz_admin_2024
+      - key: FIO_HOT_WALLET_KEY
+        sync: false
+      - key: FIO_HOT_WALLET_ADDRESS
+        value: FIO6VvxJTM2cLz1qHnjMHyDbTE3kN5AkpYEtRaVmrPGv8mrYfGCw3
+      - key: FIO_PUBLIC_ADDRESS
+        value: FIO6VvxJTM2cLz1qHnjMHyDbTE3kN5AkpYEtRaVmrPGv8mrYfGCw3
