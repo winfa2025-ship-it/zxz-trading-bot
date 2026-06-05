@@ -249,11 +249,11 @@ app.get('/api/wallet', authMiddleware, (req, res) => {
 
 app.post('/api/wallet/sync', authMiddleware, (req, res) => {
   try {
-    const { trafficGold, usd, hkd, btc, eth, usdt } = req.body;
+    const { trafficGold, usd, hkd, btc, eth, usdt, fio } = req.body;
     const db = getDb();
     ensureWallet(req.user.uid);
-    const stmt = db.prepare(`UPDATE wallets SET traffic_gold = ?, usd = ?, hkd = ?, btc = ?, eth = ?, usdt = ? WHERE user_id = ?`);
-    stmt.run(trafficGold || 0, usd || 0, hkd || 0, btc || 0, eth || 0, usdt || 0, req.user.uid);
+    const stmt = db.prepare(`UPDATE wallets SET traffic_gold = ?, usd = ?, hkd = ?, btc = ?, eth = ?, usdt = ?, fio = ? WHERE user_id = ?`);
+    stmt.run(trafficGold || 0, usd || 0, hkd || 0, btc || 0, eth || 0, usdt || 0, fio || 0, req.user.uid);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
