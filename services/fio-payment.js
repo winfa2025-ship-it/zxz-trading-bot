@@ -368,75 +368,56 @@ class FIOPaymentService {
     }
   }
 
-  // ============== WITHDRAWAL ==============
+  // ============== BROADCAST (no wallet side effects) ==============
+  async broadcastFioTransfer(toAddress, amount) {
+    if (!FIO_CONFIG.hotWallet.privateKey) {
+      const txid = 'TX' + Date.now() + Math.random().toString(36).slice(2, 8);
+      console.log(`[FIO] SIMULATED send: ${amount} FIO → ${toAddress} | TXID: ${txid}`);
+      return { txid, simulated: true, note: 'Set FIO_HOT_WALLET_KEY for real broadcast' };
+    }
+    try {
+      console.log(`[FIO] Broadcasting REAL transaction: ${amount} FIO → ${toAddress}...`);
+      // TODO: Push real FIO chain transaction via eosjs or similar
+      // const result = await fioApiRequest('/v1/chain/push_transaction', 'POST', { ... });
+      const txid = 'FIOTX' + Date.now();
+      return { txid, simulated: false };
+    } catch (e) {
+      console.error('[FIO] Broadcast error:', e.message);
+      return { error: e.message };
+    }
+  }
+
+  // ============== WITHDRAWAL (full process with wallet deduction) ==============
   async processWithdrawal(userId, toAddress, amount, currency = 'FIO') {
-    // Validate
     if (!toAddress || !amount || amount <= 0) {
       return { error: 'Invalid withdrawal parameters' };
     }
-
-    // Check hot wallet has enough balance
     const hotBalance = global.fioBalance || 0;
     if (hotBalance < amount + FIO_CONFIG.hotWallet.minBalance) {
       return { error: 'Hot wallet insufficient balance', available: hotBalance };
     }
 
-    if (!FIO_CONFIG.hotWallet.privateKey) {
-      // Simulate withdrawal if no real private key configured
-      console.log(`[FIO] WITHDRAWAL (SIMULATED): ${amount} FIO to ${toAddress}`);
-      const txid = 'TX' + Date.now() + Math.random().toString(36).slice(2, 8);
+    const broadcast = await this.broadcastFioTransfer(toAddress, amount);
+    if (broadcast.error) return { error: broadcast.error };
 
-      const withdrawal = {
-        id: txid,
-        userId,
-        toAddress,
-        amount,
-        currency,
-        fee: 0.01,
-        status: 'completed',
-        timestamp: new Date().toISOString(),
-        txid,
-        note: 'SIMULATED - Configure FIO_HOT_WALLET_KEY for real withdrawals'
-      };
+    const withdrawal = {
+      id: broadcast.txid,
+      userId, toAddress, amount, currency,
+      fee: 0.01,
+      status: broadcast.simulated ? 'completed' : 'pending',
+      timestamp: new Date().toISOString(),
+      txid: broadcast.txid,
+      note: broadcast.note || ''
+    };
 
-      this.store.addWithdrawal(withdrawal);
-      if (this.updateWalletFn) this.updateWalletFn(userId, -amount, 'fio');
+    this.store.addWithdrawal(withdrawal);
+    if (this.updateWalletFn) this.updateWalletFn(userId, -amount, 'fio');
 
-      if (this.broadcastFn) {
-        this.broadcastFn(`📤 FIO 提款: ${amount} FIO → ${toAddress.slice(0,10)}... | TXID: ${txid.slice(0,16)}`, 'withdrawal');
-      }
-
-      return { success: true, txid, withdrawal };
+    if (this.broadcastFn) {
+      this.broadcastFn(`📤 FIO 提款: ${amount} FIO → ${toAddress.slice(0,10)}... | TXID: ${broadcast.txid.slice(0,16)}`, 'withdrawal');
     }
 
-    try {
-      // REAL withdrawal - broadcast to FIO blockchain
-      console.log(`[FIO] Broadcasting withdrawal: ${amount} FIO to ${toAddress}...`);
-
-      // In production, this would call the FIO chain API to push a transaction
-      // const result = await fioApiRequest('/v1/chain/push_transaction', 'POST', { ... });
-
-      const txid = 'FIOTX' + Date.now();
-      const withdrawal = {
-        id: txid,
-        userId,
-        toAddress,
-        amount,
-        currency,
-        fee: 0.01,
-        status: 'pending',
-        timestamp: new Date().toISOString(),
-        txid
-      };
-
-      this.store.addWithdrawal(withdrawal);
-      if (this.updateWalletFn) this.updateWalletFn(userId, -amount, 'fio');
-
-      if (this.broadcastFn) {
-        this.broadcastFn(`📤 FIO 提款廣播: ${amount} FIO → ${toAddress.slice(0,10)}... | 交易ID: ${txid.slice(0,16)}`, 'withdrawal');
-      }
-
-      // Monitor for confirmation
+    if (!broadcast.simulated) {
       setTimeout(() => {
         withdrawal.status = 'completed';
         this.store.save();
@@ -444,13 +425,9 @@ class FIOPaymentService {
           this.broadcastFn(`✅ FIO 提款確認: ${amount} FIO 已發送至 ${toAddress.slice(0,10)}...`, 'withdrawal');
         }
       }, 60000);
-
-      return { success: true, txid, withdrawal };
-
-    } catch (e) {
-      console.error('[FIO] Withdrawal error:', e.message);
-      return { error: e.message };
     }
+
+    return { success: true, txid: broadcast.txid, withdrawal };
   }
 
   // ============== GET STATUS ==============

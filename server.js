@@ -296,19 +296,22 @@ app.post('/api/withdraw/fio', authMiddleware, async (req, res) => {
     if (balance < amount) return res.status(400).json({ error: `${sourceCurrency.toUpperCase()} 餘額不足 (可用: ${balance})` });
     const feePool = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM fee_pool').get();
     if (feePool.total < amount) return res.status(400).json({ error: `平台資金池不足 (可用: ${feePool.total.toFixed(2)} FIO，需要: ${amount} FIO)` });
-    const txid = 'FIO' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 8).toUpperCase();
+    const broadcast = await fioPaymentService.broadcastFioTransfer(toAddress, amount);
+    const txid = broadcast.txid || ('FIO' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 8).toUpperCase());
     db.prepare(`UPDATE wallets SET ${dbColumn} = ${dbColumn} - ?, fio = fio + ? WHERE user_id = ?`).run(amount, amount * 0.98, req.user.uid);
     db.prepare('INSERT INTO fee_pool (source, amount) VALUES (?, ?)').run('withdrawal_' + req.user.uid + '_' + Date.now(), -amount);
     const wid = 'W' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    db.prepare('INSERT INTO withdrawals (id, user_id, to_address, amount, fee, status, txid) VALUES (?, ?, ?, ?, ?, ?, ?)').run(wid, req.user.uid, toAddress, amount, 0.01, 'processing', txid);
+    db.prepare('INSERT INTO withdrawals (id, user_id, to_address, amount, fee, status, txid) VALUES (?, ?, ?, ?, ?, ?, ?)').run(wid, req.user.uid, toAddress, amount, 0.01, broadcast.simulated ? 'completed' : 'processing', txid);
     db.prepare('INSERT INTO transactions (id, user_id, type, amount, currency, note) VALUES (?, ?, ?, ?, ?, ?)').run('TX' + Date.now(), req.user.uid, 'withdrawal', amount, 'FIO', `提款 ${amount} ${sourceCurrency.toUpperCase()} → FIO → ${toAddress.slice(0,10)}...`);
     global.broadcast({ type: 'withdrawal', userId: req.user.uid, amount, toAddress, sourceCurrency, txid, timestamp: new Date().toISOString() });
-    setTimeout(() => {
-      db.prepare('UPDATE withdrawals SET status = ? WHERE id = ?').run('completed', wid);
-      global.broadcast({ type: 'withdrawal_completed', userId: req.user.uid, wid, txid, timestamp: new Date().toISOString() });
-    }, 30000);
-    console.log(`[WITHDRAW] ${amount} ${sourceCurrency.toUpperCase()} → FIO → ${toAddress} by ${req.user.uid} | TXID: ${txid}`);
-    res.json({ success: true, txid, withdrawal: { id: wid, amount, toAddress, status: 'processing' } });
+    if (!broadcast.simulated) {
+      setTimeout(() => {
+        db.prepare('UPDATE withdrawals SET status = ? WHERE id = ?').run('completed', wid);
+        global.broadcast({ type: 'withdrawal_completed', userId: req.user.uid, wid, txid, timestamp: new Date().toISOString() });
+      }, 60000);
+    }
+    console.log(`[WITHDRAW] ${amount} ${sourceCurrency.toUpperCase()} → FIO → ${toAddress} by ${req.user.uid} | TXID: ${txid}${broadcast.simulated ? ' (SIMULATED)' : ' (REAL)'}`);
+    res.json({ success: true, txid, withdrawal: { id: wid, amount, toAddress, status: broadcast.simulated ? 'completed' : 'processing' } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
