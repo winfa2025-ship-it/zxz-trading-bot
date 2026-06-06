@@ -528,7 +528,18 @@ const server = app.listen(PORT, () => {
   fioPaymentService.setCallbacks({
     broadcast: (message, type) => { global.broadcast({ type: 'fio_' + type, message, timestamp: new Date().toISOString() }); },
     updateWallet: (userId, amount, currency) => { global.broadcast({ type: 'wallet_update', userId, amount, currency, timestamp: new Date().toISOString() }); },
-    transactionLog: (type, amount, currency, status, userId) => { global.broadcast({ type: 'fio_transaction', txType: type, amount, currency, status, userId, timestamp: new Date().toISOString() }); }
+    transactionLog: (type, amount, currency, status, userId) => { global.broadcast({ type: 'fio_transaction', txType: type, amount, currency, status, userId, timestamp: new Date().toISOString() }); },
+    confirmDeposit: (amount, txid, fromAddress, userId) => {
+      try {
+        const db = getDb();
+        db.prepare('INSERT INTO fee_pool (source, amount) VALUES (?, ?)').run('deposit_' + txid, amount);
+        const total = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM fee_pool').get();
+        console.log(`[FIO] Fee pool updated: +${amount} FIO (total: ${total.total} FIO) | txid: ${txid.slice(0,16)}...`);
+        if (global.broadcast) global.broadcast({ type: 'fee_pool_update', totalFio: total.total, amount, txid, fromAddress, timestamp: new Date().toISOString() });
+      } catch (e) {
+        console.error('[FIO] Fee pool update error:', e.message);
+      }
+    }
   });
   fioPaymentService.start();
 });
