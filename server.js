@@ -9,6 +9,14 @@ const path = require('path');
 const { WebSocketServer } = require('ws');
 const { fioPaymentService, FIO_CONFIG } = require('./services/fio-payment');
 const { getDb, ensureWallet } = require('./services/db');
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://zxz-trade.anyclaw.store';
+let stripe = null;
+if (STRIPE_SECRET_KEY) {
+  try { stripe = require('stripe')(STRIPE_SECRET_KEY); console.log('[STRIPE] ✅ Initialized'); }
+  catch (e) { console.error('[STRIPE] ❌ Failed to initialize:', e.message); }
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -19,7 +27,8 @@ const CONFIG = {
   jwtSecret: JWT_SECRET,
   adminPassword: process.env.ADMIN_PASSWORD || 'zxz_admin_2024',
 };
-const BASE_INVITES = ['ZXZ2024', 'ZXZVIP', 'TEST123', 'ZXZ888', 'GOLD2024', 'FRIEND'];
+const BASE_INVITES = ['ZXZ2024', 'ZXZVIP', 'TEST123', 'ZXZ888', 'GOLD2024', 'FRIEND', 'VIP888'];
+const BASE_VIP_INVITES = ['VIP888', 'ZXZVIP', 'ZXZ888'];
 const PERMANENT_MINING_EMAILS = ['cuok2000@yahoo.com.hk'];
 
 function loadInvites() {
@@ -27,7 +36,7 @@ function loadInvites() {
     const db = getDb();
     const vipRow = db.prepare("SELECT value FROM settings WHERE key = 'vip_invites'").get();
     const vipCodes = vipRow ? vipRow.value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean) : [];
-    return { all: [...new Set([...BASE_INVITES, ...vipCodes])], vip: vipCodes };
+    return { all: [...new Set([...BASE_INVITES, ...vipCodes])], vip: [...new Set([...BASE_VIP_INVITES, ...vipCodes])] };
   } catch (e) { return { all: BASE_INVITES, vip: [] }; }
 }
 
@@ -46,6 +55,8 @@ function loadPlans() {
 }
 
 app.use(cors());
+// Stripe webhook needs raw body BEFORE global JSON parser
+app.use('/api/stripe/webhook', express.raw({ type: '*/*' }));
 app.use(express.json());
 
 // ==================== AUTH MIDDLEWARE ====================
@@ -227,7 +238,7 @@ app.post('/api/auth/register', (req, res) => {
     const code = inviteCode && invites.all.includes(inviteCode.toUpperCase()) ? inviteCode : null;
     db.prepare('INSERT INTO users (id, email, password_hash, invite_code) VALUES (?, ?, ?, ?)').run(uid, email, hash, code);
     ensureWallet(uid);
-    db.prepare('UPDATE wallets SET traffic_gold = 10, usd = 100 WHERE user_id = ?').run(uid);
+    db.prepare('UPDATE wallets SET traffic_gold = 0, usd = 0 WHERE user_id = ?').run(uid);
     let permMining = false;
     const isOwner = PERMANENT_MINING_EMAILS.includes(email);
     if (isOwner) {
@@ -239,16 +250,16 @@ app.post('/api/auth/register', (req, res) => {
       permMining = true;
       console.log(`[ADMIN] Permanent mining granted to ${email} (VIP code ${code})`);
     }
-    // Grant 1 week free subscription for valid invite code
-    const freeWeekSub = code && !isOwner;
+    // Non-VIP invite code → 1 week free subscription
+    const freeWeekSub = !!code && !invites.vip.includes(code.toUpperCase());
     if (freeWeekSub) {
-      const sid = 'SUB' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
       const expiresAt = new Date(Date.now() + 7 * 86400000).toISOString();
-      db.prepare('INSERT INTO subscriptions (id, user_id, plan, price, status, expires_at) VALUES (?, ?, ?, ?, ?, ?)').run(sid, uid, 'invite_free', 0, 'active', expiresAt);
-      console.log(`[INVITE] 1-week free subscription granted to ${email} for using invite code ${code}`);
+      const sid = 'SUB' + Date.now().toString(36);
+      db.prepare('INSERT INTO subscriptions (id, user_id, plan, price, status, expires_at) VALUES (?, ?, ?, ?, ?, ?)').run(sid, uid, 'free_week', 0, 'active', expiresAt);
+      console.log(`[INVITE] 1-week free granted to ${email} (code: ${code})`);
     }
     const token = generateToken({ id: uid, email });
-    res.json({ token, user: { uid, email, permanentMining: permMining, freeWeek: !!freeWeekSub }, wallet: { trafficGold: 10, usd: 100, hkd: 780, btc: 0, eth: 0, usdt: 0, fio: 0 } });
+    res.json({ token, user: { uid, email, permanentMining: permMining, freeWeek: freeWeekSub }, wallet: { trafficGold: 0, usd: 0, hkd: 0, btc: 0, eth: 0, usdt: 0, fio: 0 } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -626,6 +637,90 @@ app.post('/api/fio/withdraw', authMiddleware, async (req, res) => {
   const result = await fioPaymentService.processWithdrawal(userId || req.user.uid, toAddress, amount, currency || 'FIO');
   if (result.error) return res.status(400).json(result);
   res.json(result);
+});
+
+// ==================== STRIPE PAYMENT API ====================
+app.post('/api/create-checkout-session', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(501).json({ error: 'Stripe 未設定（缺少 STRIPE_SECRET_KEY）' });
+    const { plan, email } = req.body;
+    const plans = loadPlans();
+    if (!plans[plan]) return res.status(400).json({ error: '無效嘅計劃' });
+    const { price, days } = plans[plan];
+    const priceCents = Math.round(price * 100);
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      mode: 'payment',
+      customer_email: email || req.user.email,
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: { name: `ZXZ ${plan==='weekly'?'週訂閱':'月訂閱'}`, description: `${days} 天挖礦及交易權限` },
+          unit_amount: priceCents,
+        },
+        quantity: 1,
+      }],
+      metadata: { userId: req.user.uid, plan },
+      success_url: `${FRONTEND_URL}?session_id={CHECKOUT_SESSION_ID}&plan=${plan}`,
+      cancel_url: `${FRONTEND_URL}?canceled=true`,
+    });
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/stripe/verify-session', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(501).json({ error: 'Stripe 未設定' });
+    const { session_id, plan } = req.body;
+    if (!session_id) return res.status(400).json({ error: '缺少 session_id' });
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    if (session.payment_status !== 'paid') return res.status(400).json({ error: '未付款' });
+    if (session.metadata.userId !== req.user.uid) return res.status(403).json({ error: '用戶不匹配' });
+    const plans = loadPlans();
+    const p = plans[plan] || { price: plan === 'weekly' ? 10 : 35, days: plan === 'weekly' ? 7 : 30 };
+    const db = getDb();
+    const existing = db.prepare("SELECT id FROM subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now')").get(req.user.uid);
+    if (existing) return res.json({ success: true, message: '已有有效訂閱', alreadySubscribed: true });
+    const sid = 'SUB_STRIPE_' + Date.now().toString(36).toUpperCase();
+    const expiresAt = new Date(Date.now() + p.days * 86400000).toISOString();
+    db.prepare('INSERT INTO subscriptions (id, user_id, plan, price, status, expires_at) VALUES (?, ?, ?, ?, ?, ?)').run(sid, req.user.uid, 'stripe_' + plan, p.price, 'active', expiresAt);
+    db.prepare("INSERT INTO transactions (id, user_id, type, amount, currency, note) VALUES (?, ?, ?, ?, ?, ?)").run('STRIPE' + Date.now(), req.user.uid, 'subscription', p.price, 'USD', `Stripe 付款訂閱 ${p.label || plan} $${p.price}`);
+    if (global.broadcast) global.broadcast({ type: 'subscription', userId: req.user.uid, plan: 'stripe_' + plan, expiresAt });
+    res.json({ success: true, subscription: { id: sid, plan: 'stripe_' + plan, price: p.price, expiresAt, status: 'active' }, price: p.price });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/stripe/webhook', async (req, res) => {
+  try {
+    if (!stripe) return res.status(501).json({ error: 'Stripe 未設定' });
+    let event;
+    if (STRIPE_WEBHOOK_SECRET) {
+      const sig = req.headers['stripe-signature'];
+      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } else {
+      event = req.body;
+    }
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const userId = session.metadata?.userId;
+      const plan = session.metadata?.plan || 'weekly';
+      if (userId && session.payment_status === 'paid') {
+        const plans = loadPlans();
+        const p = plans[plan] || { price: plan === 'weekly' ? 10 : 35, days: plan === 'weekly' ? 7 : 30 };
+        const db = getDb();
+        const existing = db.prepare("SELECT id FROM subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now')").get(userId);
+        if (!existing) {
+          const sid = 'SUB_STRIPE_' + Date.now().toString(36).toUpperCase();
+          const expiresAt = new Date(Date.now() + p.days * 86400000).toISOString();
+          db.prepare('INSERT INTO subscriptions (id, user_id, plan, price, status, expires_at) VALUES (?, ?, ?, ?, ?, ?)').run(sid, userId, 'stripe_' + plan, p.price, 'active', expiresAt);
+          db.prepare("INSERT INTO transactions (id, user_id, type, amount, currency, note) VALUES (?, ?, ?, ?, ?, ?)").run('STRIPE_WEBHOOK_' + Date.now(), userId, 'subscription', p.price, 'USD', `Stripe 付款訂閱 (webhook) $${p.price}`);
+          console.log(`[STRIPE] Subscription activated for ${userId} via webhook (${plan})`);
+          if (global.broadcast) global.broadcast({ type: 'subscription', userId, plan: 'stripe_' + plan, expiresAt });
+        }
+      }
+    }
+    res.json({ received: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ==================== SERVER START ====================
