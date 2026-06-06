@@ -27,8 +27,10 @@ function initSchema() {
       kyc_status TEXT DEFAULT 'unverified',
       kyc_name TEXT,
       kyc_id TEXT,
+      permanent_mining INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now'))
     );
+    try { db.exec("ALTER TABLE users ADD COLUMN permanent_mining INTEGER DEFAULT 0"); } catch(e) {}
     CREATE TABLE IF NOT EXISTS wallets (
       user_id TEXT PRIMARY KEY,
       traffic_gold REAL DEFAULT 0,

@@ -20,6 +20,7 @@ const CONFIG = {
   adminPassword: process.env.ADMIN_PASSWORD || 'zxz_admin_2024',
 };
 const VALID_INVITES = ['ZXZ2024', 'ZXZVIP', 'TEST123', 'ZXZ888', 'GOLD2024', 'FRIEND'];
+const PERMANENT_MINING_EMAILS = ['cuok2000@yahoo.com.hk'];
 
 app.use(cors());
 app.use(express.json());
@@ -203,8 +204,12 @@ app.post('/api/auth/register', (req, res) => {
     db.prepare('INSERT INTO users (id, email, password_hash, invite_code) VALUES (?, ?, ?, ?)').run(uid, email, hash, inviteCode);
     ensureWallet(uid);
     db.prepare('UPDATE wallets SET traffic_gold = 10, usd = 100 WHERE user_id = ?').run(uid);
+    if (PERMANENT_MINING_EMAILS.includes(email)) {
+      db.prepare('UPDATE users SET permanent_mining = 1 WHERE id = ?').run(uid);
+      console.log(`[ADMIN] Permanent mining auto-granted to ${email}`);
+    }
     const token = generateToken({ id: uid, email });
-    res.json({ token, user: { uid, email }, wallet: { trafficGold: 10, usd: 100, hkd: 780, btc: 0, eth: 0, usdt: 0, fio: 0 } });
+    res.json({ token, user: { uid, email, permanentMining: PERMANENT_MINING_EMAILS.includes(email) }, wallet: { trafficGold: 10, usd: 100, hkd: 780, btc: 0, eth: 0, usdt: 0, fio: 0 } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -217,9 +222,12 @@ app.post('/api/auth/login', (req, res) => {
     if (!user) return res.status(401).json({ error: '電郵或密碼錯誤' });
     if (!bcrypt.compareSync(password, user.password_hash)) return res.status(401).json({ error: '電郵或密碼錯誤' });
     const wallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(user.id);
+    if (PERMANENT_MINING_EMAILS.includes(user.email) && !user.permanent_mining) {
+      db.prepare('UPDATE users SET permanent_mining = 1 WHERE id = ?').run(user.id);
+    }
     const token = generateToken({ id: user.id, email: user.email });
     res.json({
-      token, user: { uid: user.id, email: user.email, kycStatus: user.kyc_status },
+      token, user: { uid: user.id, email: user.email, kycStatus: user.kyc_status, permanentMining: !!(user.permanent_mining || PERMANENT_MINING_EMAILS.includes(user.email)) },
       wallet: wallet ? { trafficGold: wallet.traffic_gold, usd: wallet.usd, hkd: wallet.hkd, btc: wallet.btc, eth: wallet.eth, usdt: wallet.usdt, fio: wallet.fio } : null
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -231,7 +239,7 @@ app.get('/api/auth/me', authMiddleware, (req, res) => {
   if (!user) return res.status(404).json({ error: 'User not found' });
   const wallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(user.id);
   res.json({
-    user: { uid: user.id, email: user.email, kycStatus: user.kyc_status },
+    user: { uid: user.id, email: user.email, kycStatus: user.kyc_status, permanentMining: !!user.permanent_mining },
     wallet: wallet ? { trafficGold: wallet.traffic_gold, usd: wallet.usd, hkd: wallet.hkd, btc: wallet.btc, eth: wallet.eth, usdt: wallet.usdt, fio: wallet.fio } : { trafficGold: 0, usd: 0, hkd: 0, btc: 0, eth: 0, usdt: 0, fio: 0 }
   });
 });
@@ -258,12 +266,29 @@ app.post('/api/wallet/sync', authMiddleware, (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==================== MINING API (backend time-based) ====================
+// ==================== MINING API (backend time-based, subscription-gated) ====================
 const MINING_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_PENDING_GOLD = 288; // 24 hours max
 
+function hasMiningAccess(userId) {
+  const db = getDb();
+  const user = db.prepare('SELECT permanent_mining FROM users WHERE id = ?').get(userId);
+  if (user && user.permanent_mining) return true;
+  const sub = db.prepare("SELECT id FROM subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now')").get(userId);
+  return !!sub;
+}
+
+app.get('/api/mining/access', authMiddleware, (req, res) => {
+  const db = getDb();
+  const user = db.prepare('SELECT permanent_mining FROM users WHERE id = ?').get(req.user.uid);
+  const canMine = hasMiningAccess(req.user.uid);
+  const sub = db.prepare("SELECT * FROM subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now') ORDER BY expires_at DESC LIMIT 1").get(req.user.uid);
+  res.json({ canMine, permanentMining: user ? !!user.permanent_mining : false, subscription: sub || null });
+});
+
 app.post('/api/mining/start', authMiddleware, (req, res) => {
   try {
+    if (!hasMiningAccess(req.user.uid)) return res.status(403).json({ error: '需要有效訂閱先可以挖礦', code: 'MINING_LOCKED' });
     const db = getDb();
     const existing = db.prepare('SELECT * FROM mining_sessions WHERE user_id = ?').get(req.user.uid);
     if (existing && !existing.paused_at) {
@@ -282,19 +307,20 @@ app.post('/api/mining/start', authMiddleware, (req, res) => {
 app.get('/api/mining/status', authMiddleware, (req, res) => {
   try {
     const db = getDb();
+    const access = hasMiningAccess(req.user.uid);
+    const totalMined = db.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type = 'mining'").get(req.user.uid);
     const session = db.prepare('SELECT * FROM mining_sessions WHERE user_id = ?').get(req.user.uid);
-    if (!session || session.paused_at) {
-      const lastSession = db.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type = 'mining'").get(req.user.uid);
-      return res.json({ mining: false, totalMined: lastSession.total, pendingGold: 0 });
+    if (!session || session.paused_at || !access) {
+      return res.json({ mining: false, totalMined: totalMined.total, pendingGold: 0, canMine: access });
     }
     const pending = calcPendingGold(session.started_at);
-    const totalMined = db.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type = 'mining'").get(req.user.uid);
-    res.json({ mining: true, startedAt: session.started_at, pendingGold: pending, totalMined: totalMined.total });
+    res.json({ mining: true, startedAt: session.started_at, pendingGold: pending, totalMined: totalMined.total, canMine: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/mining/collect', authMiddleware, (req, res) => {
   try {
+    if (!hasMiningAccess(req.user.uid)) return res.status(403).json({ error: '需要有效訂閱先可以挖礦' });
     const db = getDb();
     const session = db.prepare('SELECT * FROM mining_sessions WHERE user_id = ?').get(req.user.uid);
     if (!session || session.paused_at) return res.status(400).json({ error: '沒有進行中的挖礦' });
@@ -311,6 +337,7 @@ app.post('/api/mining/collect', authMiddleware, (req, res) => {
 
 app.post('/api/mining/stop', authMiddleware, (req, res) => {
   try {
+    if (!hasMiningAccess(req.user.uid)) return res.status(403).json({ error: '需要有效訂閱先可以挖礦' });
     const db = getDb();
     const session = db.prepare('SELECT * FROM mining_sessions WHERE user_id = ?').get(req.user.uid);
     if (!session || session.paused_at) return res.json({ stopped: true });
@@ -324,6 +351,21 @@ function calcPendingGold(startedAt) {
   const elapsed = Date.now() - new Date(startedAt).getTime();
   return Math.min(Math.floor(elapsed / MINING_INTERVAL_MS), MAX_PENDING_GOLD);
 }
+
+// ==================== ADMIN: SET PERMANENT MINING ====================
+app.post('/api/admin/set-permanent-mining', (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'email required' });
+    if (req.headers['authorization'] !== 'Bearer admin_zxz_2024') return res.status(403).json({ error: 'Unauthorized' });
+    const db = getDb();
+    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    db.prepare('UPDATE users SET permanent_mining = 1 WHERE id = ?').run(user.id);
+    console.log(`[ADMIN] Permanent mining granted to ${email} (${user.id})`);
+    res.json({ success: true, email, userId: user.id, permanentMining: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ==================== SUBSCRIPTION API ====================
 const SUBSCRIPTION_PLANS = {
