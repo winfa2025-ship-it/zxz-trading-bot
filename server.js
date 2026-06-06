@@ -19,8 +19,31 @@ const CONFIG = {
   jwtSecret: JWT_SECRET,
   adminPassword: process.env.ADMIN_PASSWORD || 'zxz_admin_2024',
 };
-const VALID_INVITES = ['ZXZ2024', 'ZXZVIP', 'TEST123', 'ZXZ888', 'GOLD2024', 'FRIEND'];
+const BASE_INVITES = ['ZXZ2024', 'ZXZVIP', 'TEST123', 'ZXZ888', 'GOLD2024', 'FRIEND'];
 const PERMANENT_MINING_EMAILS = ['cuok2000@yahoo.com.hk'];
+
+function loadInvites() {
+  try {
+    const db = getDb();
+    const vipRow = db.prepare("SELECT value FROM settings WHERE key = 'vip_invites'").get();
+    const vipCodes = vipRow ? vipRow.value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean) : [];
+    return { all: [...new Set([...BASE_INVITES, ...vipCodes])], vip: vipCodes };
+  } catch (e) { return { all: BASE_INVITES, vip: [] }; }
+}
+
+function loadPlans() {
+  try {
+    const db = getDb();
+    const weekly = db.prepare("SELECT value FROM settings WHERE key = 'weekly_price'").get();
+    const monthly = db.prepare("SELECT value FROM settings WHERE key = 'monthly_price'").get();
+    return {
+      weekly: { price: parseFloat(weekly?.value || '10'), days: 7, label: 'Weekly' },
+      monthly: { price: parseFloat(monthly?.value || '35'), days: 30, label: 'Monthly' },
+    };
+  } catch (e) {
+    return { weekly: { price: 10, days: 7, label: 'Weekly' }, monthly: { price: 35, days: 30, label: 'Monthly' } };
+  }
+}
 
 app.use(cors());
 app.use(express.json());
@@ -195,7 +218,8 @@ app.post('/api/auth/register', (req, res) => {
   try {
     const { email, password, inviteCode } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    if (!inviteCode || !VALID_INVITES.includes(inviteCode.toUpperCase())) return res.status(400).json({ error: '無效邀請碼' });
+    const invites = loadInvites();
+    if (!inviteCode || !invites.all.includes(inviteCode.toUpperCase())) return res.status(400).json({ error: '無效邀請碼' });
     const db = getDb();
     const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
     if (existing) return res.status(400).json({ error: '電郵已被註冊' });
@@ -204,12 +228,14 @@ app.post('/api/auth/register', (req, res) => {
     db.prepare('INSERT INTO users (id, email, password_hash, invite_code) VALUES (?, ?, ?, ?)').run(uid, email, hash, inviteCode);
     ensureWallet(uid);
     db.prepare('UPDATE wallets SET traffic_gold = 10, usd = 100 WHERE user_id = ?').run(uid);
-    if (PERMANENT_MINING_EMAILS.includes(email)) {
+    const isOwner = PERMANENT_MINING_EMAILS.includes(email);
+    const isVip = invites.vip.includes(inviteCode.toUpperCase());
+    if (isOwner || isVip) {
       db.prepare('UPDATE users SET permanent_mining = 1 WHERE id = ?').run(uid);
-      console.log(`[ADMIN] Permanent mining auto-granted to ${email}`);
+      console.log(`[ADMIN] Permanent mining granted to ${email} (reason: ${isOwner ? 'owner' : 'VIP code ' + inviteCode})`);
     }
     const token = generateToken({ id: uid, email });
-    res.json({ token, user: { uid, email, permanentMining: PERMANENT_MINING_EMAILS.includes(email) }, wallet: { trafficGold: 10, usd: 100, hkd: 780, btc: 0, eth: 0, usdt: 0, fio: 0 } });
+    res.json({ token, user: { uid, email, permanentMining: !!(isOwner || isVip) }, wallet: { trafficGold: 10, usd: 100, hkd: 780, btc: 0, eth: 0, usdt: 0, fio: 0 } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -222,12 +248,16 @@ app.post('/api/auth/login', (req, res) => {
     if (!user) return res.status(401).json({ error: '電郵或密碼錯誤' });
     if (!bcrypt.compareSync(password, user.password_hash)) return res.status(401).json({ error: '電郵或密碼錯誤' });
     const wallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(user.id);
-    if (PERMANENT_MINING_EMAILS.includes(user.email) && !user.permanent_mining) {
+    const invites = loadInvites();
+    const isOwner = PERMANENT_MINING_EMAILS.includes(user.email);
+    const isVip = invites.vip.includes((user.invite_code || '').toUpperCase());
+    if ((isOwner || isVip) && !user.permanent_mining) {
       db.prepare('UPDATE users SET permanent_mining = 1 WHERE id = ?').run(user.id);
+      user.permanent_mining = 1;
     }
     const token = generateToken({ id: user.id, email: user.email });
     res.json({
-      token, user: { uid: user.id, email: user.email, kycStatus: user.kyc_status, permanentMining: !!(user.permanent_mining || PERMANENT_MINING_EMAILS.includes(user.email)) },
+      token, user: { uid: user.id, email: user.email, kycStatus: user.kyc_status, permanentMining: !!(user.permanent_mining || isOwner || isVip) },
       wallet: wallet ? { trafficGold: wallet.traffic_gold, usd: wallet.usd, hkd: wallet.hkd, btc: wallet.btc, eth: wallet.eth, usdt: wallet.usdt, fio: wallet.fio } : null
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -352,12 +382,40 @@ function calcPendingGold(startedAt) {
   return Math.min(Math.floor(elapsed / MINING_INTERVAL_MS), MAX_PENDING_GOLD);
 }
 
-// ==================== ADMIN: SET PERMANENT MINING ====================
-app.post('/api/admin/set-permanent-mining', (req, res) => {
+// ==================== ADMIN SETTINGS API ====================
+function isOwnerEmail(email) {
+  return PERMANENT_MINING_EMAILS.includes(email);
+}
+
+app.get('/api/admin/settings', authMiddleware, (req, res) => {
   try {
+    if (!isOwnerEmail(req.user.email)) return res.status(403).json({ error: 'Unauthorized' });
+    const db = getDb();
+    const rows = db.prepare('SELECT * FROM settings').all();
+    const settings = {};
+    rows.forEach(r => { settings[r.key] = r.value; });
+    settings.owner_email = req.user.email;
+    res.json(settings);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/settings', authMiddleware, (req, res) => {
+  try {
+    if (!isOwnerEmail(req.user.email)) return res.status(403).json({ error: 'Unauthorized' });
+    const { key, value } = req.body;
+    if (!key || value === undefined) return res.status(400).json({ error: 'key and value required' });
+    const db = getDb();
+    db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, String(value));
+    console.log(`[ADMIN] Setting updated: ${key} = ${value}`);
+    res.json({ success: true, key, value });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/set-permanent-mining', authMiddleware, (req, res) => {
+  try {
+    if (!isOwnerEmail(req.user.email)) return res.status(403).json({ error: 'Unauthorized' });
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'email required' });
-    if (req.headers['authorization'] !== 'Bearer admin_zxz_2024') return res.status(403).json({ error: 'Unauthorized' });
     const db = getDb();
     const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -368,16 +426,16 @@ app.post('/api/admin/set-permanent-mining', (req, res) => {
 });
 
 // ==================== SUBSCRIPTION API ====================
-const SUBSCRIPTION_PLANS = {
-  weekly: { price: 10, days: 7, label: 'Weekly' },
-  monthly: { price: 35, days: 30, label: 'Monthly' }
-};
+app.get('/api/subscription/plans', (req, res) => {
+  res.json(loadPlans());
+});
 
 app.post('/api/subscribe', authMiddleware, (req, res) => {
   try {
     const { plan } = req.body;
-    if (!SUBSCRIPTION_PLANS[plan]) return res.status(400).json({ error: '無效嘅計劃', plans: Object.keys(SUBSCRIPTION_PLANS) });
-    const { price, days, label } = SUBSCRIPTION_PLANS[plan];
+    const plans = loadPlans();
+    if (!plans[plan]) return res.status(400).json({ error: '無效嘅計劃', plans: Object.keys(plans) });
+    const { price, days, label } = plans[plan];
     const db = getDb();
     ensureWallet(req.user.uid);
     const wallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(req.user.uid);

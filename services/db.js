@@ -89,8 +89,16 @@ function initSchema() {
       expires_at TEXT NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
   try { db.exec("ALTER TABLE users ADD COLUMN permanent_mining INTEGER DEFAULT 0"); } catch(e) { /* column already exists */ }
+  try { db.exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch(e) {}
+  try { db.exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('weekly_price', '10')"); } catch(e) {}
+  try { db.exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('monthly_price', '35')"); } catch(e) {}
+  try { db.exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('vip_invites', 'ZXZVIP,ZXZ888')"); } catch(e) {}
 }
 
 function ensureWallet(userId) {
