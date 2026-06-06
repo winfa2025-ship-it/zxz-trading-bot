@@ -78,6 +78,16 @@ function initSchema() {
       paused_at TEXT,
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT,
+      plan TEXT NOT NULL,
+      price REAL NOT NULL,
+      status TEXT DEFAULT 'active',
+      started_at TEXT DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
   `);
 }
 

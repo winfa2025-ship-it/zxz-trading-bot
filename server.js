@@ -325,6 +325,52 @@ function calcPendingGold(startedAt) {
   return Math.min(Math.floor(elapsed / MINING_INTERVAL_MS), MAX_PENDING_GOLD);
 }
 
+// ==================== SUBSCRIPTION API ====================
+const SUBSCRIPTION_PLANS = {
+  weekly: { price: 10, days: 7, label: 'Weekly' },
+  monthly: { price: 35, days: 30, label: 'Monthly' }
+};
+
+app.post('/api/subscribe', authMiddleware, (req, res) => {
+  try {
+    const { plan } = req.body;
+    if (!SUBSCRIPTION_PLANS[plan]) return res.status(400).json({ error: '無效嘅計劃', plans: Object.keys(SUBSCRIPTION_PLANS) });
+    const { price, days, label } = SUBSCRIPTION_PLANS[plan];
+    const db = getDb();
+    ensureWallet(req.user.uid);
+    const wallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(req.user.uid);
+    const usdBalance = wallet ? wallet.usd || 0 : 0;
+    if (usdBalance < price) return res.status(400).json({ error: `USD 餘額不足 (需要 $${price}，現有 $${usdBalance})` });
+    const existing = db.prepare("SELECT * FROM subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now')").get(req.user.uid);
+    if (existing) return res.status(400).json({ error: '已經有有效訂閱', subscription: existing, plan: existing.plan, expiresAt: existing.expires_at });
+    const sid = 'SUB' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
+    const expiresAt = new Date(Date.now() + days * 86400000).toISOString();
+    db.prepare('UPDATE wallets SET usd = usd - ? WHERE user_id = ?').run(price, req.user.uid);
+    db.prepare('INSERT INTO subscriptions (id, user_id, plan, price, expires_at) VALUES (?, ?, ?, ?, ?)').run(sid, req.user.uid, plan, price, expiresAt);
+    db.prepare("INSERT INTO transactions (id, user_id, type, amount, currency, note) VALUES (?, ?, ?, ?, ?, ?)").run('SUB' + Date.now(), req.user.uid, 'subscription', price, 'USD', `訂閱 ${label} $${price}`);
+    if (global.broadcast) global.broadcast({ type: 'subscription', userId: req.user.uid, plan, expiresAt });
+    res.json({ success: true, subscription: { id: sid, plan, price, expiresAt, status: 'active' } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/subscription', authMiddleware, (req, res) => {
+  try {
+    const db = getDb();
+    const sub = db.prepare("SELECT * FROM subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now') ORDER BY expires_at DESC LIMIT 1").get(req.user.uid);
+    if (!sub) return res.json({ subscribed: false });
+    const daysLeft = Math.ceil((new Date(sub.expires_at) - Date.now()) / 86400000);
+    res.json({ subscribed: true, plan: sub.plan, price: sub.price, startedAt: sub.started_at, expiresAt: sub.expires_at, daysLeft });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/subscription/cancel', authMiddleware, (req, res) => {
+  try {
+    const db = getDb();
+    db.prepare("UPDATE subscriptions SET status = 'cancelled' WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now')").run(req.user.uid);
+    res.json({ cancelled: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ==================== FEE POOL API ====================
 app.get('/api/fee-pool', (req, res) => {
   const db = getDb();
