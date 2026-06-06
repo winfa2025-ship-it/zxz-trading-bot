@@ -30,7 +30,6 @@ function initSchema() {
       permanent_mining INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now'))
     );
-    try { db.exec("ALTER TABLE users ADD COLUMN permanent_mining INTEGER DEFAULT 0"); } catch(e) {}
     CREATE TABLE IF NOT EXISTS wallets (
       user_id TEXT PRIMARY KEY,
       traffic_gold REAL DEFAULT 0,
@@ -91,6 +90,7 @@ function initSchema() {
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
   `);
+  try { db.exec("ALTER TABLE users ADD COLUMN permanent_mining INTEGER DEFAULT 0"); } catch(e) { /* column already exists */ }
 }
 
 function ensureWallet(userId) {
