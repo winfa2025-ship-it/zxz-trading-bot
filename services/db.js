@@ -72,6 +72,12 @@ function initSchema() {
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
+    CREATE TABLE IF NOT EXISTS mining_sessions (
+      user_id TEXT PRIMARY KEY,
+      started_at TEXT,
+      paused_at TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
   `);
 }
 

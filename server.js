@@ -258,6 +258,73 @@ app.post('/api/wallet/sync', authMiddleware, (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== MINING API (backend time-based) ====================
+const MINING_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_PENDING_GOLD = 288; // 24 hours max
+
+app.post('/api/mining/start', authMiddleware, (req, res) => {
+  try {
+    const db = getDb();
+    const existing = db.prepare('SELECT * FROM mining_sessions WHERE user_id = ?').get(req.user.uid);
+    if (existing && !existing.paused_at) {
+      return res.json({ mining: true, startedAt: existing.started_at, pendingGold: calcPendingGold(existing.started_at) });
+    }
+    const now = new Date().toISOString();
+    if (existing) {
+      db.prepare('UPDATE mining_sessions SET started_at = ?, paused_at = NULL WHERE user_id = ?').run(now, req.user.uid);
+    } else {
+      db.prepare('INSERT INTO mining_sessions (user_id, started_at) VALUES (?, ?)').run(req.user.uid, now);
+    }
+    res.json({ mining: true, startedAt: now, pendingGold: 0 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/mining/status', authMiddleware, (req, res) => {
+  try {
+    const db = getDb();
+    const session = db.prepare('SELECT * FROM mining_sessions WHERE user_id = ?').get(req.user.uid);
+    if (!session || session.paused_at) {
+      const lastSession = db.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type = 'mining'").get(req.user.uid);
+      return res.json({ mining: false, totalMined: lastSession.total, pendingGold: 0 });
+    }
+    const pending = calcPendingGold(session.started_at);
+    const totalMined = db.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type = 'mining'").get(req.user.uid);
+    res.json({ mining: true, startedAt: session.started_at, pendingGold: pending, totalMined: totalMined.total });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/mining/collect', authMiddleware, (req, res) => {
+  try {
+    const db = getDb();
+    const session = db.prepare('SELECT * FROM mining_sessions WHERE user_id = ?').get(req.user.uid);
+    if (!session || session.paused_at) return res.status(400).json({ error: '沒有進行中的挖礦' });
+    const pending = calcPendingGold(session.started_at);
+    if (pending <= 0) return res.json({ collected: 0, pendingGold: 0 });
+    const now = new Date().toISOString();
+    db.prepare('UPDATE mining_sessions SET paused_at = ? WHERE user_id = ?').run(now, req.user.uid);
+    db.prepare('UPDATE wallets SET traffic_gold = traffic_gold + ? WHERE user_id = ?').run(pending, req.user.uid);
+    db.prepare('INSERT INTO transactions (id, user_id, type, amount, currency, note) VALUES (?, ?, ?, ?, ?, ?)').run('MIN' + Date.now() + Math.random().toString(36).slice(2, 6), req.user.uid, 'mining', pending, '流量金', `後端挖礦 ${pending} 流量金`);
+    if (global.broadcast) global.broadcast({ type: 'mining_collect', userId: req.user.uid, amount: pending, timestamp: now });
+    res.json({ collected: pending, pendingGold: 0 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/mining/stop', authMiddleware, (req, res) => {
+  try {
+    const db = getDb();
+    const session = db.prepare('SELECT * FROM mining_sessions WHERE user_id = ?').get(req.user.uid);
+    if (!session || session.paused_at) return res.json({ stopped: true });
+    const now = new Date().toISOString();
+    db.prepare('UPDATE mining_sessions SET paused_at = ? WHERE user_id = ?').run(now, req.user.uid);
+    res.json({ stopped: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+function calcPendingGold(startedAt) {
+  const elapsed = Date.now() - new Date(startedAt).getTime();
+  return Math.min(Math.floor(elapsed / MINING_INTERVAL_MS), MAX_PENDING_GOLD);
+}
+
 // ==================== FEE POOL API ====================
 app.get('/api/fee-pool', (req, res) => {
   const db = getDb();
