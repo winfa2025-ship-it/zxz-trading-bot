@@ -218,24 +218,37 @@ app.post('/api/auth/register', (req, res) => {
   try {
     const { email, password, inviteCode } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    const invites = loadInvites();
-    if (!inviteCode || !invites.all.includes(inviteCode.toUpperCase())) return res.status(400).json({ error: '無效邀請碼' });
     const db = getDb();
     const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
     if (existing) return res.status(400).json({ error: '電郵已被註冊' });
     const uid = 'U' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const hash = bcrypt.hashSync(password, 10);
-    db.prepare('INSERT INTO users (id, email, password_hash, invite_code) VALUES (?, ?, ?, ?)').run(uid, email, hash, inviteCode);
+    const invites = loadInvites();
+    const code = inviteCode && invites.all.includes(inviteCode.toUpperCase()) ? inviteCode : null;
+    db.prepare('INSERT INTO users (id, email, password_hash, invite_code) VALUES (?, ?, ?, ?)').run(uid, email, hash, code);
     ensureWallet(uid);
     db.prepare('UPDATE wallets SET traffic_gold = 10, usd = 100 WHERE user_id = ?').run(uid);
+    let permMining = false;
     const isOwner = PERMANENT_MINING_EMAILS.includes(email);
-    const isVip = invites.vip.includes(inviteCode.toUpperCase());
-    if (isOwner || isVip) {
+    if (isOwner) {
       db.prepare('UPDATE users SET permanent_mining = 1 WHERE id = ?').run(uid);
-      console.log(`[ADMIN] Permanent mining granted to ${email} (reason: ${isOwner ? 'owner' : 'VIP code ' + inviteCode})`);
+      permMining = true;
+      console.log(`[ADMIN] Permanent mining granted to owner ${email}`);
+    } else if (code && invites.vip.includes(code.toUpperCase())) {
+      db.prepare('UPDATE users SET permanent_mining = 1 WHERE id = ?').run(uid);
+      permMining = true;
+      console.log(`[ADMIN] Permanent mining granted to ${email} (VIP code ${code})`);
+    }
+    // Grant 1 week free subscription for valid invite code
+    const freeWeekSub = code && !isOwner;
+    if (freeWeekSub) {
+      const sid = 'SUB' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
+      const expiresAt = new Date(Date.now() + 7 * 86400000).toISOString();
+      db.prepare('INSERT INTO subscriptions (id, user_id, plan, price, status, expires_at) VALUES (?, ?, ?, ?, ?, ?)').run(sid, uid, 'invite_free', 0, 'active', expiresAt);
+      console.log(`[INVITE] 1-week free subscription granted to ${email} for using invite code ${code}`);
     }
     const token = generateToken({ id: uid, email });
-    res.json({ token, user: { uid, email, permanentMining: !!(isOwner || isVip) }, wallet: { trafficGold: 10, usd: 100, hkd: 780, btc: 0, eth: 0, usdt: 0, fio: 0 } });
+    res.json({ token, user: { uid, email, permanentMining: permMining, freeWeek: !!freeWeekSub }, wallet: { trafficGold: 10, usd: 100, hkd: 780, btc: 0, eth: 0, usdt: 0, fio: 0 } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
